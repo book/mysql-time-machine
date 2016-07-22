@@ -1,23 +1,26 @@
 package com.booking.validation;
 
+import com.mysql.jdbc.Blob;
+import com.mysql.jdbc.jdbc2.optional.MysqlDataSource;
+
+import java.sql.Array;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 
 /**
  * Created by lezhong on 7/14/16.
  */
 
 public class Main {
-    // JDBC driver name and database URL
-    static final String JDBC_DRIVER = "com.mysql.jdbc.Driver";
-    static final String DB_URL = "jdbc:mysql://ha101rescorerdb-01.ams4.prod.booking.com";
-
     //  Database credentials
-    static final String USER = "hadoop_repl";
-    static final String PASS = "g5uNQwBBH63Uc";
+    static final String USER = "hadoop_admin";
+    static final String PASS = "XyQxKluvC5p.g";
+    private static String sql;
+    private static ResultSet rs;
+    private static ArrayList<String> tableList = new ArrayList<>();
 
     public static void main(String[] args) throws Exception {
         Connection conn = null;
@@ -28,25 +31,38 @@ public class Main {
 
             // STEP 3: Open a connection
             System.out.println("Connecting to database...");
-            conn = DriverManager.getConnection(DB_URL,USER,PASS);
+            MysqlDataSource dataSource = new MysqlDataSource();
+            dataSource.setUser(USER);
+            dataSource.setPassword(PASS);
+            dataSource.setServerName("ha101av1rdb-01.ams4.prod.booking.com");
+            conn = dataSource.getConnection();
 
             // STEP 4: Execute a query
             System.out.println("Creating statement...");
             stmt = conn.createStatement();
-            String sql;
-            sql = "SELECT * FROM B_RoomReservation LIMIT 1";
-            ResultSet rs = stmt.executeQuery(sql);
-
-            // STEP 5: Extract data from result set
+            sql = "use av;";
+            stmt.executeQuery(sql);
+            sql = "show tables";
+            rs = stmt.executeQuery(sql);
             while (rs.next()) {
-                // Retrieve by column name
-                String last = rs.getString("last");
-
-                // Display values
-                System.out.print(rs.toString());
+                tableList.add(rs.getNString(1));
             }
-            // STEP 6: Clean-up environment
             rs.close();
+
+            for (String table: tableList) {
+                sql = String.format("SELECT * FROM %s LIMIT 1 OFFSET 0;", table);
+                ResultSet rs = stmt.executeQuery(sql);
+
+                // STEP 5: Extract data from result set
+                while (rs.next()) {
+                    // Retrieve by column name
+                    String last = rs.getString(1);
+                    // Display values
+                    System.out.print(String.format("%s -> %s\n", table, last));
+                }
+                // STEP 6: Clean-up environment
+                rs.close();
+            }
             stmt.close();
             conn.close();
         } catch (SQLException se) {
