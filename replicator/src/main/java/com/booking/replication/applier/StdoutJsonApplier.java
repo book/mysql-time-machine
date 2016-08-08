@@ -7,9 +7,11 @@ import com.booking.replication.augmenter.AugmentedSchemaChangeEvent;
 import com.booking.replication.pipeline.PipelineOrchestrator;
 
 import com.google.code.or.binlog.BinlogEventV4;
+
 import com.google.code.or.binlog.impl.event.FormatDescriptionEvent;
 import com.google.code.or.binlog.impl.event.QueryEvent;
 import com.google.code.or.binlog.impl.event.RotateEvent;
+import com.google.code.or.binlog.impl.event.TableMapEvent;
 import com.google.code.or.binlog.impl.event.XidEvent;
 
 import org.slf4j.Logger;
@@ -24,9 +26,9 @@ public class StdoutJsonApplier implements Applier  {
 
     // TODO: move these to Cmd config params
     public static final String FILTERED_TABLE_NAME = null;
-    public static final Boolean VERBOSE = false;
+    public static final Boolean VERBOSE = true;
     public static final Boolean STATS_OUT = true;
-    public static final Boolean DATA_OUT = false;
+    public static final Boolean DATA_OUT = true;
     public static final Boolean SCHEMA_OUT = false;
 
     private static final Map<String, Long> stats = new ConcurrentHashMap<>();
@@ -152,6 +154,11 @@ public class StdoutJsonApplier implements Applier  {
 
     @Override
     public void applyFormatDescriptionEvent(FormatDescriptionEvent event) {
+
+    }
+
+    @Override
+    public void applyTableMapEvent(TableMapEvent event) {
 
     }
 }

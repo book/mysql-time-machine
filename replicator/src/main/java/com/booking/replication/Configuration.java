@@ -5,6 +5,7 @@ import com.booking.replication.util.StartupParameters;
 import com.google.common.base.Joiner;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
@@ -27,7 +28,11 @@ public class Configuration {
      */
     public Configuration() {}
 
-    private String          applierType;
+    private boolean initialSnapshotMode;
+    private long    startingBinlogPosition;
+    private String  startingBinlogFileName;
+    private String  endingBinlogFileName;
+    private String  applierType;
 
     @JsonDeserialize
     private ReplicationSchema replication_schema;
@@ -42,13 +47,14 @@ public class Configuration {
     }
 
     @JsonDeserialize
-    private HBaseConfiguration hbase;
+    @JsonProperty("hbase")
+    private HBaseConfiguration hbaseConfiguration;
 
     private static class HBaseConfiguration {
+
         public String       namespace;
         public List<String> zookeeper_quorum;
         public boolean      writeRecentChangesToDeltaTables;
-
 
         @JsonDeserialize
         public HiveImports     hive_imports = new HiveImports();
@@ -56,7 +62,6 @@ public class Configuration {
         private static class HiveImports {
             public List<String> tables = Collections.emptyList();
         }
-
     }
 
     @JsonDeserialize
@@ -103,12 +108,22 @@ public class Configuration {
     }
 
     @JsonDeserialize
+    private KafkaConfiguration kafka = new KafkaConfiguration();
+
+    private static class KafkaConfiguration {
+        public String broker;
+        public List<String> tables;
+        public List<String> excludetables;
+        public String topic;
+    }
+
+    @JsonDeserialize
     public MetricsConfig metrics = new MetricsConfig();
 
     public static class MetricsConfig {
-        @JsonDeserialize
         public Duration     frequency;
 
+        @JsonDeserialize
         public HashMap<String, ReporterConfig> reporters = new HashMap<>();
 
         public static class ReporterConfig {
@@ -140,11 +155,6 @@ public class Configuration {
         return metrics.reporters.get(type);
     }
 
-    private boolean         initialSnapshotMode;
-    private long            startingBinlogPosition;
-    private String          startingBinlogFileName;
-    private String          endingBinlogFileName;
-
     /**
      * Apply command line parameters to the configuration object.
      *
@@ -154,7 +164,7 @@ public class Configuration {
 
         applierType = startupParameters.getApplier();
 
-        if (applierType.equals("hbase") && hbase == null) {
+        if (applierType.equals("hbase") && hbaseConfiguration == null) {
             throw new RuntimeException("HBase not configured");
         }
 
@@ -163,17 +173,19 @@ public class Configuration {
         startingBinlogPosition = startupParameters.getBinlogPosition();
         endingBinlogFileName   = startupParameters.getLastBinlogFileName();
 
-
-        // delta tables
-        hbase.writeRecentChangesToDeltaTables = startupParameters.isDeltaTables();
+        // hbase specific parameters
+        if (applierType.equals("hbase") && hbaseConfiguration != null) {
+            // delta tables
+            hbaseConfiguration.writeRecentChangesToDeltaTables = startupParameters.isDeltaTables();
+            // namespace
+            if (startupParameters.getHbaseNamespace() != null) {
+                hbaseConfiguration.namespace = startupParameters.getHbaseNamespace();
+            }
+        }
 
         // initial snapshot mode
         initialSnapshotMode = startupParameters.isInitialSnapshot();
 
-        //Hbase namespace
-        if (startupParameters.getHbaseNamespace() != null) {
-            hbase.namespace = startupParameters.getHbaseNamespace();
-        }
     }
 
     /**
@@ -201,7 +213,7 @@ public class Configuration {
         }
 
         if (applierType.equals("hbase")) {
-            if (hbase.namespace == null) {
+            if (hbaseConfiguration.namespace == null) {
                 throw new RuntimeException("HBase namespace cannot be null.");
             }
         }
@@ -221,15 +233,8 @@ public class Configuration {
         return "";
     }
 
-    @JsonDeserialize
-    private KafkaConfiguration kafka = new KafkaConfiguration();
-
-    private static class KafkaConfiguration {
-        public String broker;
-        public List<String> topics;
-        public List<String> excludes;
-    }
-
+    // =========================================================================
+    // Replication schema config getters
     public int getReplicantPort() {
         return replication_schema.port;
     }
@@ -238,12 +243,12 @@ public class Configuration {
         return replication_schema.server_id;
     }
 
-    public long getStartingBinlogPosition() {
-        return startingBinlogPosition;
-    }
-
     public String getReplicantDBActiveHost() {
         return this.replication_schema.host;
+    }
+
+    public String getReplicantSchemaName() {
+        return replication_schema.name;
     }
 
     public String getReplicantDBUserName() {
@@ -255,6 +260,8 @@ public class Configuration {
         return replication_schema.password;
     }
 
+    // =========================================================================
+    // Binlog file names and position getters
     public String getStartingBinlogFileName() {
         return startingBinlogFileName;
     }
@@ -263,14 +270,19 @@ public class Configuration {
         return endingBinlogFileName;
     }
 
-    public String getReplicantSchemaName() {
-        return replication_schema.name;
+    public long getStartingBinlogPosition() {
+        return startingBinlogPosition;
     }
 
+    // =========================================================================
+    // Applier type
     public String getApplierType() {
         return applierType;
     }
 
+
+    // ========================================================================
+    // Metadata store config getters
     public String getActiveSchemaDSN() {
         return String.format("jdbc:mysql://%s/%s", metadata_store.host, metadata_store.database);
     }
@@ -292,9 +304,6 @@ public class Configuration {
         return metadata_store.database;
     }
 
-    public String getHBaseQuorum() {
-        return Joiner.on(",").join(hbase.zookeeper_quorum);
-    }
 
     /**
      * Get metadata store zookeeper quorum.
@@ -326,31 +335,64 @@ public class Configuration {
         return metadata_store.file.path;
     }
 
-    public boolean isWriteRecentChangesToDeltaTables() {
-        return hbase.writeRecentChangesToDeltaTables;
-    }
-
-    public List<String> getTablesForWhichToTrackDailyChanges() {
-        return hbase.hive_imports.tables;
-    }
-
+    /**
+     * Get initial snapshot mode flag.
+     */
     public boolean isInitialSnapshotMode() {
         return initialSnapshotMode;
     }
 
+    /**
+     * HBase configuration getters.
+     */
     public String getHbaseNamespace() {
-        return hbase.namespace;
+        if (hbaseConfiguration != null) {
+            return hbaseConfiguration.namespace;
+        } else {
+            return null;
+        }
     }
 
+    public Boolean isWriteRecentChangesToDeltaTables() {
+        if (hbaseConfiguration != null) {
+            return hbaseConfiguration.writeRecentChangesToDeltaTables;
+        } else {
+            return null;
+        }
+    }
+
+    public List<String> getTablesForWhichToTrackDailyChanges() {
+        if (hbaseConfiguration != null) {
+            return hbaseConfiguration.hive_imports.tables;
+        } else {
+            return null;
+        }
+    }
+
+    public String getHBaseQuorum() {
+        if (hbaseConfiguration != null) {
+            return Joiner.on(",").join(hbaseConfiguration.zookeeper_quorum);
+        } else {
+            return null;
+        }
+    }
+
+    /**
+     * Kafka configuation getters.
+     */
     public String getKafkaBrokerAddress() {
         return kafka.broker;
     }
 
-    public List<String> getKafkaTopicList() {
-        return kafka.topics;
+    public List<String> getKafkaTableList() {
+        return kafka.tables;
     }
 
-    public List<String> getKafkaExcludeList() {
-        return kafka.excludes;
+    public List<String> getKafkaExcludeTableList() {
+        return kafka.excludetables;
+    }
+
+    public String getKafkaTopicName() {
+        return kafka.topic;
     }
 }

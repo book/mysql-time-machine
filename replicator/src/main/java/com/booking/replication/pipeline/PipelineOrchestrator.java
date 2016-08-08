@@ -12,10 +12,9 @@ import com.booking.replication.augmenter.AugmentedSchemaChangeEvent;
 import com.booking.replication.augmenter.EventAugmenter;
 import com.booking.replication.checkpoints.LastVerifiedBinlogFile;
 import com.booking.replication.queues.ReplicatorQueues;
-import com.booking.replication.schema.HBaseSchemaManager;
-import com.booking.replication.schema.TableNameMapper;
+import com.booking.replication.schema.ActiveSchemaVersion;
+import com.booking.replication.schema.exception.SchemaTransitionException;
 import com.booking.replication.schema.exception.TableMapException;
-
 import com.google.code.or.binlog.BinlogEventV4;
 import com.google.code.or.binlog.impl.event.*;
 import com.google.code.or.common.util.MySQLConstants;
@@ -31,7 +30,6 @@ import java.io.IOException;
 import java.net.URISyntaxException;
 import java.sql.SQLException;
 import java.util.HashMap;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -55,11 +53,11 @@ public class PipelineOrchestrator extends Thread {
     private final  Applier            applier;
     private final  ReplicatorQueues   queues;
     private static EventAugmenter     eventAugmenter;
-    private static HBaseSchemaManager hBaseSchemaManager;
+    private static ActiveSchemaVersion activeSchemaVersion;
 
     public CurrentTransactionMetadata currentTransactionMetadata;
 
-    private final ConcurrentHashMap<Integer, BinlogPositionInfo> binlogPositionLastKnownInfo;
+    private final com.booking.replication.pipeline.PipelinePosition pipelinePosition;
 
     private volatile boolean running = false;
 
@@ -118,30 +116,25 @@ public class PipelineOrchestrator extends Thread {
 
     public PipelineOrchestrator(
             ReplicatorQueues                  repQueues,
-            ConcurrentHashMap<Integer, BinlogPositionInfo> chm,
+            PipelinePosition                  pipelinePosition,
             Configuration                     repcfg,
             Applier                           applier
     ) throws SQLException, URISyntaxException {
         queues = repQueues;
         configuration = repcfg;
 
-        eventAugmenter = new EventAugmenter(repcfg);
+        activeSchemaVersion =  new ActiveSchemaVersion(configuration);
+        eventAugmenter = new EventAugmenter(activeSchemaVersion);
 
         currentTransactionMetadata = new CurrentTransactionMetadata();
 
-        if (configuration.getApplierType().equals("hbase")) {
-            hBaseSchemaManager = new HBaseSchemaManager(repcfg.getHBaseQuorum());
-        }
-
         this.applier = applier;
 
-        binlogPositionLastKnownInfo = chm;
-
-        LOGGER.info("Created consumer with binlogPositionLastKnownInfo position => { "
+        LOGGER.info("Created consumer with binlog position => { "
                 + " binlogFileName => "
-                +   binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_BINLOG_POSITION).getBinlogFilename()
+                +   pipelinePosition.getCurrentPosition().getBinlogFilename()
                 + ", binlogPosition => "
-                +   binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_BINLOG_POSITION).getBinlogPosition()
+                +   pipelinePosition.getCurrentPosition().getBinlogPosition()
                 + " }"
         );
 
@@ -152,6 +145,8 @@ public class PipelineOrchestrator extends Thread {
                     return replDelay;
                 }
             });
+
+        this.pipelinePosition = pipelinePosition;
     }
 
     public boolean isRunning() {
@@ -183,7 +178,7 @@ public class PipelineOrchestrator extends Thread {
                     timeOfLastEvent = System.currentTimeMillis();
                     eventsReceivedCounter.mark();
 
-                    if (!skipEvent(event)) {
+                    if (! skipEvent(event)) {
                         calculateAndPropagateChanges(event);
                         eventsProcessedCounter.mark();
                     } else {
@@ -199,6 +194,10 @@ public class PipelineOrchestrator extends Thread {
                         applier.forceFlush();
                     }
                 }
+            } catch (SchemaTransitionException e) {
+                LOGGER.error("SchemaTransitionException, requesting replicator shutdown...", e);
+                LOGGER.error("Original exception:", e.getOriginalException());
+                requestReplicatorShutdown();
             } catch (InterruptedException e) {
                 LOGGER.error("InterruptedException, requesting replicator shutdown...", e);
                 requestReplicatorShutdown();
@@ -233,10 +232,10 @@ public class PipelineOrchestrator extends Thread {
      *      b. calculateAndPropagateChanges event to AugmentedQueue
      * </p>
      */
-    public void calculateAndPropagateChanges(BinlogEventV4 event) throws IOException, TableMapException {
+    public void calculateAndPropagateChanges(BinlogEventV4 event)
+            throws IOException, TableMapException, SchemaTransitionException {
 
         AugmentedRowsEvent augmentedRowsEvent;
-        AugmentedSchemaChangeEvent augmentedSchemaChangeEvent;
 
         if (fakeMicrosecondCounter > 999998) {
             fakeMicrosecondCounter = 0;
@@ -260,8 +259,41 @@ public class PipelineOrchestrator extends Thread {
                 } else if (isBegin(querySQL, isDDL)) {
                     currentTransactionMetadata = new CurrentTransactionMetadata();
                 } else if (isDDL) {
-                    augmentedSchemaChangeEvent = eventAugmenter.transitionSchemaToNextVersion(event);
-                    applier.applyAugmentedSchemaChangeEvent(augmentedSchemaChangeEvent, this);
+                    // Sync all the things here.
+                    applier.forceFlush();
+                    applier.waitUntilAllRowsAreCommitted(event);
+
+                    try {
+                        AugmentedSchemaChangeEvent augmentedSchemaChangeEvent = activeSchemaVersion.transitionSchemaToNextVersion(
+                                eventAugmenter.getSchemaTransitionSequence(event),
+                                event.getHeader().getTimestamp()
+                        );
+
+                        String currentBinlogFileName =
+                                pipelinePosition.getCurrentPosition().getBinlogFilename();
+
+                        long nextBinlogPosition = event.getHeader().getPosition();
+
+                        int currentSlaveId = configuration.getReplicantDBServerID();
+                        LastVerifiedBinlogFile marker = new LastVerifiedBinlogFile(
+                                currentSlaveId,
+                                currentBinlogFileName,
+                                nextBinlogPosition
+                        );
+
+                        LOGGER.info("Save new marker: " + marker.toJson());
+                        Coordinator.saveCheckpointMarker(marker);
+                        applier.applyAugmentedSchemaChangeEvent(augmentedSchemaChangeEvent, this);
+                    } catch (SchemaTransitionException e) {
+                        setRunning(false);
+                        requestReplicatorShutdown();
+                        throw e;
+                    } catch (Exception e) {
+                        LOGGER.error("Failed to save checkpoint marker!");
+                        e.printStackTrace();
+                        setRunning(false);
+                        requestReplicatorShutdown();
+                    }
                 } else {
                     LOGGER.warn("Unexpected query event: " + querySQL);
                 }
@@ -285,47 +317,25 @@ public class PipelineOrchestrator extends Thread {
                     fakeMicrosecondCounter++;
                     doTimestampOverride(event);
                 }
+
                 try {
+
                     currentTransactionMetadata.updateCache((TableMapEvent) event);
+
                     long tableID = ((TableMapEvent) event).getTableId();
                     String dbName = currentTransactionMetadata.getDBNameFromTableID(tableID);
-                    LOGGER.debug("processing events for { db => " + dbName + " table => " + tableName + " } ");
+                    LOGGER.debug("processing events for { db => " + dbName + " table => " + ((TableMapEvent) event).getTableName() + " } ");
                     LOGGER.debug("fakeMicrosecondCounter at tableMap event => " + fakeMicrosecondCounter);
-                    String hbaseTableName = configuration.getHbaseNamespace().toLowerCase()
-                            + ":"
-                            + tableName.toLowerCase();
-                    if (configuration.getApplierType().equals("hbase")) {
-                        if (! hBaseSchemaManager.isTableKnownToHBase(hbaseTableName)) {
-                            // This should not happen in tableMapEvent, unless we are
-                            // replaying the binlog.
-                            // TODO: load hbase tables on start-up so this never happens
-                            hBaseSchemaManager.createMirroredTableIfNotExists(hbaseTableName, DEFAULT_VERSIONS_FOR_MIRRORED_TABLES);
-                        }
-                        if (configuration.isWriteRecentChangesToDeltaTables()) {
-                            //String replicantSchema = ((TableMapEvent) event).getDatabaseName().toString();
-                            String mysqlTableName = ((TableMapEvent) event).getTableName().toString();
 
-                            if (configuration.getTablesForWhichToTrackDailyChanges().contains(mysqlTableName)) {
+                    applier.applyTableMapEvent((TableMapEvent) event);
 
-                                long eventTimestampMicroSec = event.getHeader().getTimestamp();
+                    updatePipelinePositionForMapEvent((TableMapEvent) event, fakeMicrosecondCounter);
 
-                                String deltaTableName = TableNameMapper.getCurrentDeltaTableName(
-                                        eventTimestampMicroSec,
-                                        configuration.getHbaseNamespace(),
-                                        mysqlTableName,
-                                        configuration.isInitialSnapshotMode());
-                                if (! hBaseSchemaManager.isTableKnownToHBase(deltaTableName)) {
-                                    boolean isInitialSnapshotMode = configuration.isInitialSnapshotMode();
-                                    hBaseSchemaManager.createDeltaTableIfNotExists(deltaTableName, isInitialSnapshotMode);
-                                }
-                            }
-                        }
-                    }
-                    updateLastKnownPositionForMapEvent((TableMapEvent) event, fakeMicrosecondCounter);
                 } catch (Exception e) {
                     LOGGER.error("Could not execute mapEvent block. Requesting replicator shutdown...", e);
                     requestReplicatorShutdown();
                 }
+
                 break;
 
             // Data event:
@@ -335,7 +345,7 @@ public class PipelineOrchestrator extends Thread {
                 doTimestampOverride(event);
                 augmentedRowsEvent = eventAugmenter.mapDataEventToSchema((AbstractRowEvent) event, this);
                 applier.applyAugmentedRowsEvent(augmentedRowsEvent,this);
-                updateLastKnownPosition((AbstractRowEvent) event);
+                updatCurrentPipelinePosition((AbstractRowEvent) event, fakeMicrosecondCounter);
                 updateEventCounter.mark();
                 break;
 
@@ -345,7 +355,7 @@ public class PipelineOrchestrator extends Thread {
                 doTimestampOverride(event);
                 augmentedRowsEvent = eventAugmenter.mapDataEventToSchema((AbstractRowEvent) event, this);
                 applier.applyAugmentedRowsEvent(augmentedRowsEvent,this);
-                updateLastKnownPosition((AbstractRowEvent) event);
+                updatCurrentPipelinePosition((AbstractRowEvent) event, fakeMicrosecondCounter);
                 insertEventCounter.mark();
                 break;
 
@@ -355,7 +365,7 @@ public class PipelineOrchestrator extends Thread {
                 doTimestampOverride(event);
                 augmentedRowsEvent = eventAugmenter.mapDataEventToSchema((AbstractRowEvent) event, this);
                 applier.applyAugmentedRowsEvent(augmentedRowsEvent,this);
-                updateLastKnownPosition((AbstractRowEvent) event);
+                updatCurrentPipelinePosition((AbstractRowEvent) event, fakeMicrosecondCounter);
                 deleteEventCounter.mark();
                 break;
 
@@ -385,12 +395,14 @@ public class PipelineOrchestrator extends Thread {
                 //TODO: Investigate if this is the right thing to do.
                 applier.waitUntilAllRowsAreCommitted(rotateEvent);
 
-                LOGGER.info("All rows committed");
                 String currentBinlogFileName =
-                        binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_MAP_EVENT_POSITION).getBinlogFilename();
+                        pipelinePosition.getCurrentPosition().getBinlogFilename();
 
                 String nextBinlogFileName = rotateEvent.getBinlogFileName().toString();
                 long nextBinlogPosition = rotateEvent.getBinlogPosition();
+
+                LOGGER.info("All rows committed for binlog file "
+                        + currentBinlogFileName + ", moving to next binlog " + nextBinlogFileName);
 
                 int currentSlaveId = configuration.getReplicantDBServerID();
                 LastVerifiedBinlogFile marker = new LastVerifiedBinlogFile(currentSlaveId, nextBinlogFileName, nextBinlogPosition);
@@ -490,7 +502,7 @@ public class PipelineOrchestrator extends Thread {
      * @param  event Binlog event that needs to be checked
      * @return shouldSkip Weather event should be skipped or processed
      */
-    public boolean skipEvent(BinlogEventV4 event) {
+    public boolean skipEvent(BinlogEventV4 event) throws Exception {
         boolean eventIsTracked      = false;
         switch (event.getHeader().getEventType()) {
             // Query Event:
@@ -526,16 +538,18 @@ public class PipelineOrchestrator extends Thread {
                 } else if (isDDL) {
                     // DDL event should always contain db name
                     String dbName = ((QueryEvent) event).getDatabaseName().toString();
+                    if ((dbName == null) || dbName.length() == 0) {
+                        LOGGER.warn("No Db name in Query Event. Extracted SQL: " + ((QueryEvent) event).getSql().toString());
+                    }
                     if (isReplicant(dbName)) {
                         eventIsTracked = true;
                     } else {
                         eventIsTracked = false;
-                        LOGGER.warn("DDL statement " + querySQL + " on non-replicated database [" + dbName + "].");
-
+                        LOGGER.warn("DDL statement " + querySQL + " on non-replicated database: " + dbName + "");
                     }
                 } else {
-// TODO: handle View statement
-//                     LOGGER.warn("Received non-DDL, non-COMMIT, non-BEGIN query: " + querySQL);
+                    // TODO: handle View statement
+                    // LOGGER.warn("Received non-DDL, non-COMMIT, non-BEGIN query: " + querySQL);
                 }
                 break;
 
@@ -564,7 +578,7 @@ public class PipelineOrchestrator extends Thread {
                 // binlog file - once at the end of the binlog file (as it should be)
                 // and once at the beginning of the next binlog file (which is a bug)
                 String currentBinlogFile =
-                        binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_MAP_EVENT_POSITION).getBinlogFilename();
+                        pipelinePosition.getCurrentPosition().getBinlogFilename();
                 if (rotateEventAllreadySeenForBinlogFile.containsKey(currentBinlogFile)) {
                     eventIsTracked = false;
                 } else {
@@ -622,41 +636,28 @@ public class PipelineOrchestrator extends Thread {
         }
     }
 
-    private void updateLastKnownPositionForMapEvent(TableMapEvent event, long fakeMicrosecondCounter) {
+    private void updatePipelinePositionForMapEvent(TableMapEvent event, long fakeMicrosecondCounter) {
 
-        String lastBinlogFileName;
-        if (binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_MAP_EVENT_POSITION) != null) {
-            lastBinlogFileName = binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_MAP_EVENT_POSITION).getBinlogFilename();
-        } else {
-            lastBinlogFileName = "";
+        if (this.pipelinePosition.getLastMapEventPosition() == null) {
+            this.pipelinePosition.setLastMapEventPosition(new BinlogPositionInfo(
+                    event.getBinlogFilename(),
+                    event.getHeader().getPosition(),
+                    fakeMicrosecondCounter
+            ));
         }
 
-        if (!event.getBinlogFilename().equals(lastBinlogFileName)) {
-            LOGGER.info("moving to next binlog file [ " + lastBinlogFileName + " ] ==>> [ " + event.getBinlogFilename() + " ]");
-        }
+        this.pipelinePosition.getLastMapEventPosition().setBinlogFilename(((TableMapEvent) event).getBinlogFilename());
+        this.pipelinePosition.getLastMapEventPosition().setBinlogPosition(((TableMapEvent) event).getHeader().getPosition());
+        this.pipelinePosition.getLastMapEventPosition().setFakeMicrosecondsCounter(fakeMicrosecondCounter);
 
-        binlogPositionLastKnownInfo.put(
-                Constants.LAST_KNOWN_MAP_EVENT_POSITION,
-                new BinlogPositionInfo(
-                        event.getBinlogFilename(),
-                        event.getHeader().getPosition(),
-                        fakeMicrosecondCounter
-                )
-        );
-
-        LOGGER.debug("Updated last known map event position to => ["
-                + binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_MAP_EVENT_POSITION).getBinlogFilename()
-                + ":"
-                + binlogPositionLastKnownInfo.get(Constants.LAST_KNOWN_MAP_EVENT_POSITION).getBinlogPosition()
-                + "]"
-        );
+        this.pipelinePosition.getCurrentPosition().setBinlogFilename(((TableMapEvent) event).getBinlogFilename());
+        this.pipelinePosition.getCurrentPosition().setBinlogPosition(((TableMapEvent) event).getHeader().getPosition());
+        this.pipelinePosition.getCurrentPosition().setFakeMicrosecondsCounter(fakeMicrosecondCounter);
     }
 
-    private void updateLastKnownPosition(AbstractRowEvent event) {
-        BinlogPositionInfo lastKnownPosition = new BinlogPositionInfo(
-                event.getBinlogFilename(),
-                event.getHeader().getPosition()
-        );
-        binlogPositionLastKnownInfo.put(Constants.LAST_KNOWN_BINLOG_POSITION, lastKnownPosition);
+    private void updatCurrentPipelinePosition(AbstractRowEvent event, long fakeMicrosecondCounter) {
+        this.pipelinePosition.getCurrentPosition().setBinlogFilename(event.getBinlogFilename());
+        this.pipelinePosition.getCurrentPosition().setBinlogPosition(event.getHeader().getPosition());
+        this.pipelinePosition.getCurrentPosition().setFakeMicrosecondsCounter(fakeMicrosecondCounter);
     }
 }

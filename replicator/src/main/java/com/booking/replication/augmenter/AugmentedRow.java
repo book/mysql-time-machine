@@ -11,8 +11,6 @@ import com.google.code.or.binlog.impl.event.BinlogEventV4HeaderImpl;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.security.InvalidParameterException;
 import java.util.*;
@@ -35,24 +33,61 @@ public class AugmentedRow {
     @JsonIgnoreProperties({"headerLength", "position"})
     private BinlogEventV4Header eventV4Header;
 
+    @JsonDeserialize(as = TableSchema.class)
     private TableSchema tableSchema;
-    private String tableName;
-    private List<String> primaryKeyColumns = new ArrayList<>();
-    private String uniqueID = UUID.randomUUID().toString();
+
+    private final String       binlogFileName;
+    private final long         rowBinlogEventOrdinal;
+    private final String       tableName;
+    private final List<String> primaryKeyColumns = new ArrayList<>();
+
+    private final String       rowUUID;
+    private final String       rowBinlogPositionID;
 
     // eventColumns: {
-    //      column_name => $name,
-    //          value_before => $1,
-    //          value_after => $v2,
-    //          ...,
-    //          type => $type
+    //          column_name  => $name,
+    //          value_before => $v1,
+    //          value_after  => $v2,
+    //          type         => $type
     //      }
     // }
     private HashMap<String,Map<String,String>> eventColumns = new HashMap<>();
 
     private String eventType;
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(AugmentedRow.class);
+    /**
+     * Create AugmentedRow.
+     *
+     * @param binlogFileName      Name of the binlog file that contains current row
+     * @param rowOrdinal          Order of the row in the binlog event that contains the row
+     * @param tableName           Table name of the row
+     * @param tableSchema         TableSchema object
+     * @param eventType           Event type identifier (INSERT/UPDATE/DELETE)
+     * @param binlogEventV4Header BinlogEventV4Header object
+     *
+     * @throws InvalidParameterException    Invalid parameter
+     * @throws TableMapException            Invalid table
+     */
+    public AugmentedRow(
+            String              binlogFileName,
+            long                rowOrdinal,
+            String              tableName,
+            TableSchema         tableSchema,
+            String              eventType,
+            BinlogEventV4Header binlogEventV4Header
+    ) {
+        this.rowBinlogEventOrdinal = rowOrdinal;
+        this.binlogFileName = binlogFileName;
+        this.tableName = tableName;
+        this.tableSchema = tableSchema;
+        this.eventType = eventType;
+        this.eventV4Header = binlogEventV4Header;
+
+        Long eventPosition = eventV4Header.getPosition();
+
+        rowBinlogPositionID = String.format("%s:%020d:%03d", this.binlogFileName, eventPosition, this.rowBinlogEventOrdinal);
+        rowUUID = UUID.randomUUID().toString();;
+    }
 
     /**
      * Add column data.
@@ -60,13 +95,15 @@ public class AugmentedRow {
      * @param columnName    Name of the column to update
      * @param valueBefore   Value before the update
      * @param valueAfter    Value after the update
+     * @param columnType    Column type
      * @throws InvalidParameterException    Invalid parameter
      * @throws TableMapException            Invalid table
      */
     public void addColumnDataForUpdate(
             String columnName,
             String valueBefore,
-            String valueAfter
+            String valueAfter,
+            String columnType
     ) throws InvalidParameterException, TableMapException {
 
         if (columnName == null) {
@@ -81,20 +118,22 @@ public class AugmentedRow {
         } else {
             eventColumns.get(columnName).put("value_before", valueBefore);
             eventColumns.get(columnName).put("value_after", valueAfter);
+            eventColumns.get(columnName).put("type", columnType);
         }
     }
 
     /**
      * Add column data.
-     *
      * @param columnName Name of the column to insert
-     * @param value      Value to insert
+     * @param value       Value to insert
+     * @param columnType  Column type
      */
     public void addColumnDataForInsert(
             String columnName,
-            String value
-    ) {
+            String value,
+            String columnType) {
         eventColumns.get(columnName).put("value", value);
+        eventColumns.get(columnName).put("type", columnType);
     }
 
     /**
@@ -121,43 +160,7 @@ public class AugmentedRow {
     }
 
     public String toJson() {
-        return JsonBuilder.dataEventToJson(this);
-    }
-
-    public String getUniqueID() {
-        return uniqueID;
-    }
-
-    public void setUniqueID(String uuid) {
-        this.uniqueID = uuid;
-    }
-
-    public String getTableName() {
-        return tableName;
-    }
-
-    public void setTableName(String tableName) {
-        this.tableName = tableName;
-    }
-
-    public HashMap<String, Map<String, String>> getEventColumns() {
-        return eventColumns;
-    }
-
-    public void setEventColumns(HashMap<String, Map<String, String>> eventColumns) {
-        this.eventColumns = eventColumns;
-    }
-
-    public TableSchema getTableSchema() {
-        return tableSchema;
-    }
-
-    public List<String> getPrimaryKeyColumns() {
-        return primaryKeyColumns;
-    }
-
-    public void setPrimaryKeyColumns(List<String> primaryKeyColumns) {
-        this.primaryKeyColumns = primaryKeyColumns;
+        return JsonBuilder.augmentedRowToJson(this);
     }
 
     /**
@@ -206,5 +209,41 @@ public class AugmentedRow {
 
     public void setEventV4Header(BinlogEventV4Header eventV4Header) {
         this.eventV4Header = eventV4Header;
+    }
+
+    public String getRowBinlogPositionID() {
+        return this.rowBinlogPositionID;
+    }
+
+    public String getRowUUID() {
+        return rowUUID;
+    }
+
+    public String getTableName() {
+        return tableName;
+    }
+
+    public HashMap<String, Map<String, String>> getEventColumns() {
+        return eventColumns;
+    }
+
+    public void setEventColumns(HashMap<String, Map<String, String>> eventColumns) {
+        this.eventColumns = eventColumns;
+    }
+
+    public TableSchema getTableSchema() {
+        return tableSchema;
+    }
+
+    public List<String> getPrimaryKeyColumns() {
+        return primaryKeyColumns;
+    }
+
+    public String getBinlogFileName() {
+        return binlogFileName;
+    }
+
+    public long getRowBinlogEventOrdinal() {
+        return rowBinlogEventOrdinal;
     }
 }

@@ -4,7 +4,7 @@ import com.booking.replication.applier.Applier;
 import com.booking.replication.applier.HBaseApplier;
 import com.booking.replication.applier.KafkaApplier;
 import com.booking.replication.applier.StdoutJsonApplier;
-import com.booking.replication.checkpoints.SafeCheckPoint;
+import com.booking.replication.checkpoints.LastVerifiedBinlogFile;
 import com.booking.replication.monitor.Overseer;
 import com.booking.replication.pipeline.BinlogEventProducer;
 import com.booking.replication.pipeline.BinlogPositionInfo;
@@ -17,7 +17,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.sql.SQLException;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -40,7 +39,9 @@ public class Replicator {
     public Replicator(Configuration configuration) throws SQLException, URISyntaxException, IOException {
 
         // Position Tracking
-        ConcurrentHashMap<Integer, BinlogPositionInfo> lastKnownInfo = new ConcurrentHashMap<>();
+        com.booking.replication.pipeline.PipelinePosition pipelinePosition =
+                new com.booking.replication.pipeline.PipelinePosition();
+
         BinlogPositionInfo startBinlogPosition;
 
         if (configuration.getStartingBinlogFileName() != null) {
@@ -51,17 +52,20 @@ public class Replicator {
             );
         } else {
             // Safe Check Point
-            SafeCheckPoint safeCheckPoint = Coordinator.getCheckpointMarker();
+            LastVerifiedBinlogFile safeCheckPoint = Coordinator.getCheckpointMarker();
 
             if ( safeCheckPoint != null ) {
                 LOGGER.info("Start binlog not specified, reading metadata from coordinator");
-                startBinlogPosition = new BinlogPositionInfo(safeCheckPoint.getSafeCheckPointMarker(), 4L);
+                startBinlogPosition = new BinlogPositionInfo(
+                        safeCheckPoint.getSafeCheckPointMarker(),
+                        safeCheckPoint.getSafeCheckPointPosition()
+                );
             } else {
                 throw new RuntimeException("Could not find start binlog in metadata or startup options");
             }
         }
 
-        lastKnownInfo.put(Constants.LAST_KNOWN_BINLOG_POSITION, startBinlogPosition);
+        pipelinePosition.setCurrentPosition(startBinlogPosition);
 
         if (configuration.getLastBinlogFileName() != null
                 && startBinlogPosition.greaterThan(new BinlogPositionInfo(configuration.getLastBinlogFileName(), 4L))) {
@@ -82,7 +86,11 @@ public class Replicator {
         ReplicatorQueues replicatorQueues = new ReplicatorQueues();
 
         // Producer
-        binlogEventProducer = new BinlogEventProducer(replicatorQueues.rawQueue, lastKnownInfo, configuration);
+        binlogEventProducer = new BinlogEventProducer(
+                replicatorQueues.rawQueue,
+                pipelinePosition,
+                configuration
+            );
 
         // Applier
         Applier applier;
@@ -106,7 +114,7 @@ public class Replicator {
         // Orchestrator
         pipelineOrchestrator = new PipelineOrchestrator(
                 replicatorQueues,
-                lastKnownInfo,
+                pipelinePosition,
                 configuration,
                 applier
         );
@@ -115,7 +123,7 @@ public class Replicator {
         overseer = new Overseer(
                 binlogEventProducer,
                 pipelineOrchestrator,
-                lastKnownInfo
+                pipelinePosition
         );
     }
 

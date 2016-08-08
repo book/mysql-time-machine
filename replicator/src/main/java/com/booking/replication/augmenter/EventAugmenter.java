@@ -2,11 +2,9 @@ package com.booking.replication.augmenter;
 
 import static com.codahale.metrics.MetricRegistry.name;
 
-import com.booking.replication.Configuration;
 import com.booking.replication.Metrics;
 import com.booking.replication.pipeline.PipelineOrchestrator;
 import com.booking.replication.schema.ActiveSchemaVersion;
-import com.booking.replication.schema.SchemaVersionSnapshot;
 import com.booking.replication.schema.column.ColumnSchema;
 import com.booking.replication.schema.column.types.Converter;
 import com.booking.replication.schema.exception.SchemaTransitionException;
@@ -52,10 +50,10 @@ public class EventAugmenter {
     /**
      * Event Augmenter constructor.
      *
-     * @param  replicatorConfiguration Replicator Configuration object
+     * @param asv Active schema version
      */
-    public EventAugmenter(Configuration replicatorConfiguration) throws SQLException, URISyntaxException {
-        activeSchemaVersion = new ActiveSchemaVersion(replicatorConfiguration);
+    public EventAugmenter(ActiveSchemaVersion asv) throws SQLException, URISyntaxException {
+        activeSchemaVersion = asv;
     }
 
     /**
@@ -67,78 +65,19 @@ public class EventAugmenter {
         return activeSchemaVersion;
     }
 
-    /**
-     * Transitions active schema to a new state that corresponds
-     * to the current binlog position.
-     *
-     * <p>Steps performed are:
-     *
-     *       1. make snapshot of active schema before change
-     *       2. transition to the new schema
-     *       3. snapshot schema after change
-     *       4. create augmentedSchemaChangeEvent
-     *       5. return augmentedSchemaChangeEvent
-     * </p>
-     */
-    public AugmentedSchemaChangeEvent transitionSchemaToNextVersion(BinlogEventV4 event)
-            throws SchemaTransitionException {
-
-        ActiveSchemaVersion futureSchemaVersion;
-
-        // 1. make snapshot of active schema before change
-        SchemaVersionSnapshot schemaVersionSnapshotBeforeTransition =
-                new SchemaVersionSnapshot(activeSchemaVersion);
-
-        // 2. transition to the new schema
-        HashMap<String, String> schemaTransitionSequence = getDDLFromEvent(event);
-        if (schemaTransitionSequence != null) {
-            // since active schema has a postfix, we need to make sure that queires that
-            // specify schema explictly are rewriten so they work properly on active schema
-            String ddl = schemaTransitionSequence.get("ddl"); // TODO: FIX sometimes null!!!
-
-            String replicatedSchema = schemaTransitionSequence.get("databaseName");
-            String activeSchemaTransitionDDL = rewriteActiveSchemaName(ddl, replicatedSchema);
-            LOGGER.debug(String.format("Active schema: %s\nApplying alter table:\n%s",
-                    replicatedSchema,
-                    activeSchemaTransitionDDL
-                    ));
-
-            schemaTransitionSequence.put("ddl", activeSchemaTransitionDDL);
-            futureSchemaVersion = activeSchemaVersion.applyDDL(schemaTransitionSequence);
-            if (futureSchemaVersion != null) {
-                activeSchemaVersion = futureSchemaVersion;
-            } else {
-                throw new SchemaTransitionException(String.format(
-                        "Failed to calculateAndPropagateChanges with DDL statement: %s",
-                        activeSchemaTransitionDDL));
-            }
-        } else {
-            throw new SchemaTransitionException("DDL statement can not be null!");
-        }
-
-        // 3. snapshot schema after change
-        SchemaVersionSnapshot schemaVersionSnapshotAfterTransition =
-                new SchemaVersionSnapshot(activeSchemaVersion);
-
-        // 4. create & return augmentedSchemaChangeEvent
-        Long   timestamp = event.getHeader().getTimestamp();
-
-        return new AugmentedSchemaChangeEvent(
-                schemaVersionSnapshotBeforeTransition,
-                schemaTransitionSequence,
-                schemaVersionSnapshotAfterTransition,
-                timestamp
-        );
-    }
-
-    private HashMap<String,String> getDDLFromEvent(BinlogEventV4 event) throws SchemaTransitionException {
+    public HashMap<String, String> getSchemaTransitionSequence(BinlogEventV4 event) throws SchemaTransitionException {
 
         if (event instanceof QueryEvent) {
             String ddl = ((QueryEvent) event).getSql().toString();
 
             // query
             HashMap<String, String> sqlCommands = new HashMap<>();
-            sqlCommands.put("ddl", ddl);
+            sqlCommands.put("databaseName", ((QueryEvent) event).getDatabaseName().toString());
+            sqlCommands.put("originalDDL", ddl);
+
+            // since active schema has a postfix, we need to make sure that queires that
+            // specify schema explictly are rewriten so they work properly on active schema
+            sqlCommands.put("ddl", rewriteActiveSchemaName(ddl, ((QueryEvent) event).getDatabaseName().toString()));
 
             // status variables
             for (StatusVariable av : ((QueryEvent) event).getStatusVariables()) {
@@ -245,13 +184,21 @@ public class EventAugmenter {
         int numberOfColumns = writeRowsEvent.getColumnCount().intValue();
 
         // In write event there is only a List<Row> from getRows. No before after naturally.
+
+        long rowBinlogEventOrdinal = 0; // order of the row in the binlog event
         for (Row row : writeRowsEvent.getRows()) {
 
-            AugmentedRow augEvent = new AugmentedRow();
-            augEvent.setTableName(tableName);
-            augEvent.setTableSchema(tableSchema);
-            augEvent.setEventType("INSERT");
-            augEvent.setEventV4Header(writeRowsEvent.getHeader());
+            String evType = "INSERT";
+            rowBinlogEventOrdinal++;
+
+            AugmentedRow augEvent = new AugmentedRow(
+                    augEventGroup.getBinlogFileName(),
+                    rowBinlogEventOrdinal,
+                    tableName,
+                    tableSchema,
+                    evType,
+                    writeRowsEvent.getHeader()
+            );
 
             tableMetrics.inserted.inc();
             tableMetrics.processed.inc();
@@ -269,7 +216,7 @@ public class EventAugmenter {
 
                 String value = Converter.orTypeToString(columnValue, columnSchema);
 
-                augEvent.addColumnDataForInsert(columnName, value);
+                augEvent.addColumnDataForInsert(columnName, value, columnSchema.getColumnType());
             }
             augEventGroup.addSingleRowEvent(augEvent);
         }
@@ -300,18 +247,21 @@ public class EventAugmenter {
 
         AugmentedRowsEvent augEventGroup = new AugmentedRowsEvent(writeRowsEvent);
         augEventGroup.setMysqlTableName(tableName);
-        
+
+        long rowBinlogEventOrdinal = 0; // order of the row in the binlog event
         for (Row row : writeRowsEvent.getRows()) {
 
-            tableMetrics.inserted.inc();
-            tableMetrics.processed.inc();
+            String evType = "INSERT";
+            rowBinlogEventOrdinal++;
 
-            AugmentedRow augEvent = new AugmentedRow();
-
-            augEvent.setTableName(tableName);
-            augEvent.setTableSchema(tableSchema);
-            augEvent.setEventType("INSERT");
-            augEvent.setEventV4Header(writeRowsEvent.getHeader());
+            AugmentedRow augEvent = new AugmentedRow(
+                augEventGroup.getBinlogFileName(),
+                rowBinlogEventOrdinal,
+                tableName,
+                tableSchema,
+                evType,
+                writeRowsEvent.getHeader()
+            );
 
             //column index counting starts with 1
             for (int columnIndex = 1; columnIndex <= numberOfColumns ; columnIndex++ ) {
@@ -328,9 +278,12 @@ public class EventAugmenter {
                 // type cast
                 String value = Converter.orTypeToString(columnValue, columnSchema);
 
-                augEvent.addColumnDataForInsert(columnName, value);
+                augEvent.addColumnDataForInsert(columnName, value, columnSchema.getColumnType());
             }
             augEventGroup.addSingleRowEvent(augEvent);
+
+            tableMetrics.inserted.inc();
+            tableMetrics.processed.inc();
         }
 
         return augEventGroup;
@@ -356,16 +309,19 @@ public class EventAugmenter {
 
         int numberOfColumns = deleteRowsEvent.getColumnCount().intValue();
 
+        long rowBinlogEventOrdinal = 0; // order of the row in the binlog event
         for (Row row : deleteRowsEvent.getRows()) {
 
-            tableMetrics.processed.inc();
-            tableMetrics.deleted.inc();
-
-            AugmentedRow augEvent = new AugmentedRow();
-            augEvent.setTableName(tableName);
-            augEvent.setTableSchema(tableSchema);
-            augEvent.setEventType("DELETE");
-            augEvent.setEventV4Header(deleteRowsEvent.getHeader());
+            String evType =  "DELETE";
+            rowBinlogEventOrdinal++;
+            AugmentedRow augEvent = new AugmentedRow(
+                    augEventGroup.getBinlogFileName(),
+                    rowBinlogEventOrdinal,
+                    tableName,
+                    tableSchema,
+                    evType,
+                    deleteRowsEvent.getHeader()
+            );
 
             //column index counting starts with 1
             for (int columnIndex = 1; columnIndex <= numberOfColumns ; columnIndex++ ) {
@@ -380,9 +336,12 @@ public class EventAugmenter {
 
                 String value = Converter.orTypeToString(columnValue, columnSchema);
 
-                augEvent.addColumnDataForInsert(columnName, value);
+                augEvent.addColumnDataForInsert(columnName, value, columnSchema.getColumnType());
             }
             augEventGroup.addSingleRowEvent(augEvent);
+
+            tableMetrics.processed.inc();
+            tableMetrics.deleted.inc();
         }
 
         return augEventGroup;
@@ -410,16 +369,20 @@ public class EventAugmenter {
 
         int numberOfColumns = deleteRowsEvent.getColumnCount().intValue();
 
+        long rowBinlogEventOrdinal = 0; // order of the row in the binlog event
         for (Row row : deleteRowsEvent.getRows()) {
 
-            tableMetrics.deleted.inc();
-            tableMetrics.processed.inc();
+            String evType = "DELETE";
+            rowBinlogEventOrdinal++;
 
-            AugmentedRow augEvent = new AugmentedRow();
-            augEvent.setTableName(tableName);
-            augEvent.setTableSchema(tableSchema);
-            augEvent.setEventType("DELETE");
-            augEvent.setEventV4Header(deleteRowsEvent.getHeader());
+            AugmentedRow augEvent = new AugmentedRow(
+                    augEventGroup.getBinlogFileName(),
+                    rowBinlogEventOrdinal,
+                    tableName,
+                    tableSchema,
+                    evType,
+                    deleteRowsEvent.getHeader()
+            );
 
             //column index counting starts with 1
             for (int columnIndex = 1; columnIndex <= numberOfColumns ; columnIndex++ ) {
@@ -435,9 +398,12 @@ public class EventAugmenter {
                 String value = Converter.orTypeToString(columnValue, columnSchema);
 
                 // TODO: delete has same content as insert, but add a differently named method for clarity
-                augEvent.addColumnDataForInsert(columnName, value);
+                augEvent.addColumnDataForInsert(columnName, value, columnSchema.getColumnType());
             }
             augEventGroup.addSingleRowEvent(augEvent);
+
+            tableMetrics.deleted.inc();
+            tableMetrics.processed.inc();
         }
 
         return augEventGroup;
@@ -463,17 +429,22 @@ public class EventAugmenter {
 
         int numberOfColumns = upEvent.getColumnCount().intValue();
 
+        long rowBinlogEventOrdinal = 0; // order of the row in the binlog event
+
         // rowPair is pair <rowBeforeChange, rowAfterChange>
         for (Pair<Row> rowPair : upEvent.getRows()) {
 
-            tableMetrics.processed.inc();
-            tableMetrics.updated.inc();
+            String evType = "UPDATE";
+            rowBinlogEventOrdinal++;
 
-            AugmentedRow augEvent = new AugmentedRow();
-            augEvent.setTableName(tableName);
-            augEvent.setTableSchema(tableSchema); // <- We can do this since in data event schema is unchanged
-            augEvent.setEventType("UPDATE");
-            augEvent.setEventV4Header(upEvent.getHeader());
+            AugmentedRow augEvent = new AugmentedRow(
+                augEventGroup.getBinlogFileName(),
+                rowBinlogEventOrdinal,
+                tableName,
+                tableSchema,
+                evType,
+                upEvent.getHeader()
+            );
 
             //column index counting starts with 1
             for (int columnIndex = 1; columnIndex <= numberOfColumns ; columnIndex++ ) {
@@ -491,9 +462,14 @@ public class EventAugmenter {
                 String valueBefore = Converter.orTypeToString(columnValueBefore, columnSchema);
                 String valueAfter  = Converter.orTypeToString(columnValueAfter, columnSchema);
 
-                augEvent.addColumnDataForUpdate(columnName, valueBefore, valueAfter);
+                String columnType  = columnSchema.getColumnType();
+
+                augEvent.addColumnDataForUpdate(columnName, valueBefore, valueAfter, columnType);
             }
             augEventGroup.addSingleRowEvent(augEvent);
+
+            tableMetrics.processed.inc();
+            tableMetrics.updated.inc();
         }
 
         return augEventGroup;
@@ -520,17 +496,22 @@ public class EventAugmenter {
 
         int numberOfColumns = upEvent.getColumnCount().intValue();
 
+        long rowBinlogEventOrdinal = 0; // order of the row in the binlog event
+
         // rowPair is pair <rowBeforeChange, rowAfterChange>
         for (Pair<Row> rowPair : upEvent.getRows()) {
 
-            tableMetrics.processed.inc();
-            tableMetrics.updated.inc();
+            String evType = "UPDATE";
+            rowBinlogEventOrdinal++;
 
-            AugmentedRow augEvent = new AugmentedRow();
-            augEvent.setTableName(tableName);
-            augEvent.setTableSchema(tableSchema); // <- We can do this since in data event schema is unchanged
-            augEvent.setEventType("UPDATE");
-            augEvent.setEventV4Header(upEvent.getHeader());
+            AugmentedRow augEvent = new AugmentedRow(
+                augEventGroup.getBinlogFileName(),
+                rowBinlogEventOrdinal,
+                tableName,
+                tableSchema,
+                evType,
+                upEvent.getHeader()
+            );
 
             //column index counting starts with 1
             for (int columnIndex = 1; columnIndex <= numberOfColumns ; columnIndex++ ) {
@@ -551,9 +532,10 @@ public class EventAugmenter {
 
                 try {
                     String valueBefore = Converter.orTypeToString(columnValueBefore, columnSchema);
-                    String valueAfter = Converter.orTypeToString(columnValueAfter, columnSchema);
+                    String valueAfter  = Converter.orTypeToString(columnValueAfter, columnSchema);
+                    String columnType  = columnSchema.getColumnType();
 
-                    augEvent.addColumnDataForUpdate(columnName, valueBefore, valueAfter);
+                    augEvent.addColumnDataForUpdate(columnName, valueBefore, valueAfter, columnType);
                 } catch (TableMapException e) {
                     TableMapException rethrow = new TableMapException(e.getMessage(), upEvent);
                     rethrow.setStackTrace(e.getStackTrace());
@@ -561,8 +543,10 @@ public class EventAugmenter {
                 }
             }
             augEventGroup.addSingleRowEvent(augEvent);
-        }
 
+            tableMetrics.processed.inc();
+            tableMetrics.updated.inc();
+        }
         return augEventGroup;
     }
 
