@@ -1,139 +1,134 @@
 package com.booking.validation;
 
-import com.mysql.jdbc.Blob;
-import com.mysql.jdbc.jdbc2.optional.MysqlDataSource;
-import com.mysql.jdbc.log.Log;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.client.Get;
-import org.apache.hadoop.hbase.client.HTable;
-import org.apache.hadoop.hbase.client.Result;
-import org.apache.hadoop.hbase.util.Bytes;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
-import java.sql.Array;
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.concurrent.ExecutionException;
+import java.util.HashMap;
+import java.util.Scanner;
 
 /**
  * Created by lezhong on 7/14/16.
  */
 
 
-
 public class Main {
-    private static class MySQLGenerator {
-        //  Database credentials
-        static final String USER = "hadoop_admin";
-        static final String PASS = "XyQxKluvC5p.g";
-        private static String sql;
-        private static ResultSet rs;
-        private static ArrayList<String> tableList = new ArrayList<>();
-        Connection conn = null;
-        Statement stmt = null;
-        MysqlDataSource dataSource;
-        private static final Logger LOGGER = LoggerFactory.getLogger(MySQLGenerator.class);
+    static class Config {
+        String host;
+        String table;
+        String hbaseTable;
+        HashMap<String, Boolean> tests;
 
-        MySQLGenerator() {
-            try {
-                // STEP 2: Register JDBC driver
-                Class.forName("com.mysql.jdbc.Driver");
-
-                // STEP 3: Open a connection
-                LOGGER.info("Connecting to database...");
-                dataSource = new MysqlDataSource();
-                dataSource.setUser(USER);
-                dataSource.setPassword(PASS);
-                dataSource.setServerName("ha101av1rdb-01.ams4.prod.booking.com");
-                conn = dataSource.getConnection();
-
-                // STEP 4: Execute a query
-                LOGGER.info("Creating statement...");
-                stmt = conn.createStatement();
-                sql = "use av;";
-                stmt.executeQuery(sql);
-                stmt.close();
-            } catch (SQLException se) {
-                // Handle errors for JDBC
-                se.printStackTrace();
-            } catch (Exception e) {
-                // Handle errors for Class.forName
-                e.printStackTrace();
-            }
-        }
-
-        ArrayList<String> getTableList() throws Exception {
-            stmt = conn.createStatement();
-            sql = "show tables";
-            rs = stmt.executeQuery(sql);
-            while (rs.next()) {
-                tableList.add(rs.getNString(1));
-            }
-            rs.close();
-            stmt.close();
-            return tableList;
-        }
-
-        ResultSet getResult(String table, int offset) throws SQLException {
-            sql = String.format("SELECT * FROM %s LIMIT 1 OFFSET %d;", table, offset);
-            stmt = conn.createStatement();
-            ResultSet rs = stmt.executeQuery(sql);
-            return rs;
-        }
-
-        void next() {
-
+        Config() {
+            host = "";
+            table = "";
+            hbaseTable = "";
+            tests = new HashMap<>();
         }
     }
 
-
-    private static class HBaseGenerator {
-        private Configuration config;
-        private HTable table;
-        private static final Logger LOGGER = LoggerFactory.getLogger(MySQLGenerator.class);
-
-        HBaseGenerator() {
-            config = HBaseConfiguration.create();
-            config.set("hbase.zookeeper.quorum", "hbase-zk1-host");
+    static Config get_config(String dbName) {
+        Config ans = new Config();
+        switch (dbName) {
+            case "rescore": {
+                ans.host = "ha101rescorerdb-01";
+                ans.table = "B_RoomReservation";
+                ans.hbaseTable = "rescore:b_roomreservation";
+                ans.tests.put("version_count", false);
+                ans.tests.put("cell_values", true);
+                break;
+            }
+            case "bp": {
+                ans.host = "ha101bprdb-01";
+                ans.table = "B_Hotel";
+                ans.hbaseTable = "bp:b_hotel";
+                ans.tests.put("version_count", false);
+                ans.tests.put("cell_values", true);
+                break;
+            }
+            case "dw": {
+                ans.host = "ha101dwrdb-01";
+                ans.table = "Reservation";
+                ans.hbaseTable = "replicator_dw:reservation";
+                ans.tests.put("version_count", false);
+                ans.tests.put("cell_values", true);
+                break;
+            }
+            case "av": {
+                ans.host = "ha101av1rdb-01";
+                ans.table = "_Availability_201304_old";
+                ans.hbaseTable = "av:availability_201304";
+                ans.tests.put("version_count", false);
+                ans.tests.put("cell_values", true);
+                break;
+            }
+            default: {
+            }
         }
+        return ans;
+    }
 
-        void setTable(String tableName) throws IOException {
-            table = new HTable(config, tableName);
-        }
+    public static void get_column_type(String db, String table) {
+        String sql = String.format("SELECT "
+                + "COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME "
+                + "FROM "
+                + "COLUMNS "
+                + "WHERE "
+                + "TABLE_SCHEMA = %s "
+                + "AND "
+                + "TABLE_NAME = %s", db, table);
 
-        Result getResult(String rowName) throws IOException {
-            Get hbaseGet = new Get(Bytes.toBytes(rowName));
-            Result result = table.get(hbaseGet);
-            return result;
-        }
-
-        void next() {
-
-        }
     }
 
     public static void main(String[] args) throws Exception {
-        MySQLGenerator mysqlGenerator = new MySQLGenerator();
-        HBaseGenerator hbaseGenerator = new HBaseGenerator();
-        ArrayList<String> tableList = mysqlGenerator.getTableList();
-        for (String table : tableList) {
-            hbaseGenerator.setTable(table);;
-            for (int offset = 0; ; offset++) {
-                ResultSet rsMySQL = mysqlGenerator.getResult(table, offset);
-                System.out.println(table);
-                // while (rsMySQL.next()) {
-                //    System.out.println(String.format("%s\n", rsMySQL.getString(1)));
-                // }
-                Result rsHBase = hbaseGenerator.getResult(String.format("row%d", offset));
-                System.out.println(String.format("%d\n", rsHBase.size()));
-            }
-        }
+        String dbName = "rescore";
+        Config dbConfig = get_config(dbName);
+        String restserverHost = "hb111tooolserver-01"; // TODO: move to config
+        String dataSource = String.format("dbi:mysql:%s;host=%s", dbName, dbConfig.host);
+        String dataSourceInfo = String.format("dbi:mysql:information_schema;host=%s", dbConfig.host);
+        String username = "hadoop_repl";
+        System.out.println("Enter pwd please :");
+        Scanner sc = new Scanner(System.in);
+        String password = sc.next();
+
+        // dbh_info
+
+        // Column Types
+
+        // Value Match
+
+        // Hbase Connection
+
+        // get_ids
+
+        // $chunks = partition 1, @ids;
+
+        System.out.println("Total of ... ids from table $table will be tested, split info chunks.");
+
+        int chunkNo = 0;
+
+        HashMap<String, Integer> stats = new HashMap<>();
+        stats.put("COLUMNS_PASS_TOTAL", 0);
+        stats.put("COLUMNS_FAIL_TOTAL", 0);
+        stats.put("IDS_PASS_TOTAL", 0);
+        stats.put("IDS_FAIL_TOTAL", 0);
+
+// get_tests();
+
+
+
+
+//        MySQLGenerator mysqlGenerator = new MySQLGenerator();
+//        HBaseGenerator hbaseGenerator = new HBaseGenerator();
+//        ArrayList<String> tableList = mysqlGenerator.getTableList();
+//        for (String table : tableList) {
+//            hbaseGenerator.setTable(table);;
+//            for (int offset = 0; ; offset++) {
+//                ResultSet rsMySQL = mysqlGenerator.getResult(table, offset);
+//                System.out.println(table);
+//                // while (rsMySQL.next()) {
+//                //    System.out.println(String.format("%s\n", rsMySQL.getString(1)));
+//                // }
+//                Result rsHBase = hbaseGenerator.getResult(String.format("row%d", offset));
+//                System.out.println(String.format("%d\n", rsHBase.size()));
+//            }
+//        }
 
     } // end main
 }
