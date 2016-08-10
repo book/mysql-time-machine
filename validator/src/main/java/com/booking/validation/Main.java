@@ -1,7 +1,12 @@
 package com.booking.validation;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Scanner;
+
 
 /**
  * Created by lezhong on 7/14/16.
@@ -9,6 +14,8 @@ import java.util.Scanner;
 
 
 public class Main {
+    private static final Logger LOGGER = LoggerFactory.getLogger(Main.class);
+
     static class Config {
         String host;
         String table;
@@ -52,7 +59,7 @@ public class Main {
             }
             case "av": {
                 ans.host = "ha101av1rdb-01";
-                ans.table = "_Availability_201304_old";
+                ans.table = "Availability_201304";
                 ans.hbaseTable = "av:availability_201304";
                 ans.tests.put("version_count", false);
                 ans.tests.put("cell_values", true);
@@ -64,32 +71,20 @@ public class Main {
         return ans;
     }
 
-    public static void get_column_type(String db, String table) {
-        String sql = String.format("SELECT "
-                + "COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME "
-                + "FROM "
-                + "COLUMNS "
-                + "WHERE "
-                + "TABLE_SCHEMA = %s "
-                + "AND "
-                + "TABLE_NAME = %s", db, table);
-
-    }
-
     public static void main(String[] args) throws Exception {
-        String dbName = "rescore";
+        String dbName = "av";
         Config dbConfig = get_config(dbName);
-        String restserverHost = "hb111tooolserver-01"; // TODO: move to config
+        String restserverHost = "hb111toolserver-01"; // TODO: move to config
         String dataSource = String.format("dbi:mysql:%s;host=%s", dbName, dbConfig.host);
         String dataSourceInfo = String.format("dbi:mysql:information_schema;host=%s", dbConfig.host);
-        String username = "hadoop_repl";
+        String username = "hadoop_admin";
         System.out.println("Enter pwd please :");
         Scanner sc = new Scanner(System.in);
         String password = sc.next();
 
-        // dbh_info
+        MySQLConnector dbhInfo = new MySQLConnector(username, password);
 
-        // Column Types
+        ArrayList<MySQLConnector.ColumnTypes> columnTypes = dbhInfo.getColumnTypes(dbName, dbConfig.table);
 
         // Value Match
 
